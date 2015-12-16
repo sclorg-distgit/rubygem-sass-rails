@@ -1,0 +1,190 @@
+From e56c2fbf60ef2bd879aae6f6163c90326b4017be Mon Sep 17 00:00:00 2001
+From: Matthew Draper <matthew@trebex.net>
+Date: Wed, 23 Apr 2014 04:42:06 +0930
+Subject: [PATCH] Restore special behaviour in SassImporter
+
+---
+ Gemfile                          |  1 +
+ lib/sass/rails/importer.rb       | 78 +++++++++++++++++++++++++++++++++++++++-
+ lib/sass/rails/template.rb       | 11 ++----
+ sass-rails.gemspec               |  2 +-
+ sass-rails.gemspec.erb           |  2 +-
+ test/gemfiles/Gemfile-master     |  1 +
+ 6 files changed, 84 insertions(+), 11 deletions(-)
+
+diff --git a/Gemfile b/Gemfile
+index e93ce25..94da4f5 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -4,5 +4,6 @@ source "https://rubygems.org"
+ gemspec
+ 
+ gem "rails"
++gem "sprockets-rails"
+ 
+ gem "sqlite3"
+diff --git a/lib/sass/rails/importer.rb b/lib/sass/rails/importer.rb
+index e31302c..699b7a1 100644
+--- a/lib/sass/rails/importer.rb
++++ b/lib/sass/rails/importer.rb
+@@ -2,7 +2,15 @@
+ 
+ module Sass
+   module Rails
+-    class SassImporter < Sprockets::SassImporter
++    class SassImporter < Sass::Importers::Filesystem
++      GLOB = /\*|\[.+\]/
++
++      attr_reader :context
++      def initialize(context, *args)
++        @context = context
++        super(*args)
++      end
++
+       def extensions
+         {
+           'css'          => :scss,
+@@ -15,6 +23,74 @@ def extensions
+           'css.sass.erb' => :sass
+         }.merge!(super)
+       end
++
++      def find_relative(name, base, options)
++        if name =~ GLOB
++          glob_imports(name, Pathname.new(base), options)
++        else
++          engine_from_path(name, File.dirname(base), options)
++        end
++      end
++
++      def find(name, options)
++        if name =~ GLOB
++          nil # globs must be relative
++        else
++          engine_from_path(name, root, options)
++        end
++      end
++
++      private
++
++        def each_globbed_file(glob, base_pathname, options)
++          Dir["#{base_pathname}/#{glob}"].sort.each do |filename|
++            next if filename == options[:filename]
++            if File.directory?(filename)
++              context.depend_on(filename)
++              context.depend_on(File.expand_path('..', filename))
++            elsif context.asset_requirable?(filename)
++              context.depend_on(File.dirname(filename))
++              yield filename
++            end
++          end
++        end
++
++        def glob_imports(glob, base_pathname, options)
++          contents = ""
++          each_globbed_file(glob, base_pathname.dirname, options) do |filename|
++            contents << "@import #{Pathname.new(filename).relative_path_from(base_pathname.dirname).to_s.inspect};\n"
++          end
++          return nil if contents.empty?
++          Sass::Engine.new(contents, options.merge(
++            :filename => base_pathname.to_s,
++            :importer => self,
++            :syntax => :scss
++          ))
++        end
++
++
++        def engine_from_path(name, dir, options)
++          full_filename, syntax = Sass::Util.destructure(find_real_file(dir, name, options))
++          return unless full_filename && File.readable?(full_filename)
++
++          context.depend_on full_filename
++          engine = Sass::Engine.new(evaluate(full_filename), options.merge(
++            syntax: syntax,
++            filename: full_filename,
++            importer: self
++          ))
++
++          engine
++        end
++
++        def evaluate(filename)
++          attributes = context.environment.attributes_for(filename)
++          processors = context.environment.preprocessors(attributes.content_type) +
++            attributes.engines.reverse - [Sass::Rails::ScssTemplate, Sass::Rails::SassTemplate]
++
++          context.evaluate(filename, processors: processors)
++        end
++
+     end
+   end
+ end
+diff --git a/lib/sass/rails/template.rb b/lib/sass/rails/template.rb
+index be7ccca..d319905 100644
+--- a/lib/sass/rails/template.rb
++++ b/lib/sass/rails/template.rb
+@@ -12,8 +12,8 @@ def evaluate(context, locals, &block)
+           :line => line,
+           :syntax => syntax,
+           :cache_store => cache_store,
+-          :importer => SassImporter.new(context.pathname.to_s),
+-          :load_paths => context.environment.paths.map { |path| SassImporter.new(path.to_s) },
++          :importer => SassImporter.new(context, context.pathname.to_s),
++          :load_paths => context.environment.paths.map { |path| SassImporter.new(context, path.to_s) },
+           :sprockets => {
+             :context => context,
+             :environment => context.environment
+@@ -22,12 +22,7 @@ def evaluate(context, locals, &block)
+ 
+         sass_config = context.environment.context_class.sass_config.merge(options)
+ 
+-        result = ::Sass::Engine.new(data, sass_config).render
+-
+-        filenames = ([options[:importer].imported_filenames] + options[:load_path].map(&:imported_filenames)).flatten.uniq
+-        filenames.each { |filename| context.depend_on(filename) }
+-
+-        result
++        ::Sass::Engine.new(data, sass_config).render
+       rescue ::Sass::SyntaxError => e
+         context.__LINE__ = e.sass_backtrace.first[:line]
+         raise e
+diff --git a/sass-rails.gemspec b/sass-rails.gemspec
+index 2ce5250..d4d67ec 100644
+--- a/sass-rails.gemspec
++++ b/sass-rails.gemspec
+@@ -15,7 +15,7 @@ Gem::Specification.new do |s|
+ 
+   s.rubyforge_project = "sass-rails"
+ 
+-  s.add_dependency 'sass',            '~> 3.2.0'
++  s.add_dependency 'sass',            '~> 3.2'
+   s.add_dependency 'railties',        '>= 4.0.0', '< 5.0'
+   s.add_dependency 'sprockets-rails', '~> 2.0'
+   s.add_dependency 'sprockets',       '~> 2.12'
+diff --git a/sass-rails.gemspec.erb b/sass-rails.gemspec.erb
+index 3bf13fd..296d330 100644
+--- a/sass-rails.gemspec.erb
++++ b/sass-rails.gemspec.erb
+@@ -15,7 +15,7 @@ Gem::Specification.new do |s|
+ 
+   s.rubyforge_project = "sass-rails"
+ 
+-  s.add_dependency 'sass',            '~> 3.2.0'
++  s.add_dependency 'sass',            '~> 3.2'
+   s.add_dependency 'railties',        '>= 4.0.0', '< 5.0'
+   s.add_dependency 'sprockets-rails', '~> 2.0'
+   s.add_dependency 'sprockets',       '~> 2.12'
+diff --git a/test/gemfiles/Gemfile-master b/test/gemfiles/Gemfile-master
+index 7b09aaf..587850a 100644
+--- a/test/gemfiles/Gemfile-master
++++ b/test/gemfiles/Gemfile-master
+@@ -4,5 +4,6 @@ source "https://rubygems.org"
+ gemspec path: '../..'
+ 
+ gem "rails", github: 'rails/rails', branch: 'master'
++gem "sprockets-rails", github: 'rails/sprockets-rails', branch: '2-1-stable'
+ 
+ gem "sqlite3"
+-- 
+1.9.3
+
